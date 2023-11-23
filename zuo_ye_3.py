@@ -1,222 +1,274 @@
-# Numerical Operations
-import math
+# Import necessary packages.
+from time import sleep
+
 import numpy as np
-
-# Reading/Writing Data
-import pandas as pd  # 我一般喜欢用这个读入数据
-import os
-import csv
-
-# For Progress Bar
-from tqdm import tqdm
-
-# Pytorch
+import pandas as pd
 import torch
+import os
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+import torchvision.transforms as transforms
+from PIL import Image
+# "ConcatDataset" and "Subset" are possibly useful when doing semi-supervised learning.
+from torch.utils.data import ConcatDataset, DataLoader, Subset, Dataset
+from torchvision.datasets import DatasetFolder, VisionDataset
 
-# For plotting learning curve
-from torch.utils.tensorboard import SummaryWriter
+# This is for the progress bar.
+from tqdm.auto import tqdm
+import random
 
-
-def same_seed(seed):
-    '''Fixes random number generator seeds for reproducibility.'''
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+# from ML2022Spring_HW2 import Classifier
 
 
-# sklearn有一个包也可以实现train_valid_split和predict功能。
-def train_valid_split(data_set, valid_ratio, seed):
-    '''Split provided training data into training set and validation set'''
-    valid_set_size = int(valid_ratio * len(data_set))
-    train_set_size = len(data_set) - valid_set_size
-    train_set, valid_set = random_split(data_set, [train_set_size, valid_set_size],
-                                        generator=torch.Generator().manual_seed(seed))
-    return np.array(train_set), np.array(valid_set)
+myseed = 6666  # set a random seed for reproducibility
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(myseed)
+torch.manual_seed(myseed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(myseed)
+
+# Normally, We don't need augmentations in testing and validation.
+# All we need here is to resize the PIL image and transform it into Tensor.
+test_tfm = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),
+])
+
+# However, it is also possible to use augmentation in the testing phase.
+# You may use train_tfm to produce a variety of images and then test using ensemble methods
+train_tfm = transforms.Compose([
+    # Resize the image into a fixed shape (height = width = 128)
+    transforms.Resize((128, 128)),
+    # You may add some transforms here.
+    # ToTensor() should be the last one of the transforms.
+    transforms.ToTensor(),
+])
 
 
-def predict(test_loader, model, device):
-    model.eval()  # Set your model to evaluation mode.
-    preds = []
-    for x in tqdm(test_loader):
-        x = x.to(device)
-        with torch.no_grad():
-            pred = model(x)
-            preds.append(pred.detach().cpu())
-    preds = torch.cat(preds, dim=0).numpy()
-    return preds
-
-
-class COVID19Dataset(Dataset):
-    '''
-    x: Features.
-    y: Targets, if none, do prediction.
-    '''
-
-    def __init__(self, x, y=None):
-        if y is None:
-            self.y = y
-        else:
-            self.y = torch.FloatTensor(y)
-        self.x = torch.FloatTensor(x)
-
-    def __getitem__(self, idx):
-        if self.y is None:
-            return self.x[idx]
-        else:
-            return self.x[idx], self.y[idx]
+class FoodDataset(Dataset):
+    def __init__(self, path, tfm=test_tfm, files=None):
+        super(FoodDataset).__init__()
+        self.path = path
+        self.files = sorted([os.path.join(path, x) for x in os.listdir(path) if x.endswith(".jpg")])
+        if files != None:
+            self.files = files
+        print(f"One {path} sample", self.files[0])
+        self.transform = tfm
 
     def __len__(self):
-        return len(self.x)
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        fname = self.files[idx]
+        im = Image.open(fname)
+        im = self.transform(im)
+        # im = self.data[idx]
+        try:
+            label = int(fname.split("\\")[-1].split("_")[0])
+        except:
+            label = -1  # test has no label
+        return im, label
 
 
-class My_Model(nn.Module):
-    def __init__(self, input_dim):
-        super(My_Model, self).__init__()
-        # TODO: modify model's structure, be aware of dimensions.
-        #一个简单的三层全链接层的神经网络模型
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, 16),#全连接层
-            nn.ReLU(),#激活函数
-            nn.Linear(16, 8),
+class Classifier(nn.Module):
+    def __init__(self):
+        super(Classifier, self).__init__()
+        # torch.nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        # torch.nn.MaxPool2d(kernel_size, stride, padding)
+        # input 維度 [3, 128, 128]
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 64, 3, 1, 1),  # [64, 128, 128]
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Linear(8, 1)
+            nn.MaxPool2d(2, 2, 0),  # [64, 64, 64]
+            nn.Conv2d(64, 128, 3, 1, 1),  # [128, 64, 64]
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2, 0),  # [128, 32, 32]
+            nn.Conv2d(128, 256, 3, 1, 1),  # [256, 32, 32]
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2, 0),  # [256, 16, 16]
+            nn.Conv2d(256, 512, 3, 1, 1),  # [512, 16, 16]
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2, 0),  # [512, 8, 8]
+            nn.Conv2d(512, 512, 3, 1, 1),  # [512, 8, 8]
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2, 0),  # [512, 4, 4]
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(512 * 4 * 4, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 11)
         )
 
     def forward(self, x):
-        x = self.layers(x)
-        x = x.squeeze(1) # (B, 1) -> (B)
-        return x
+        out = self.cnn(x)
+        out = out.view(out.size()[0], -1)
+        return self.fc(out)
 
 
-def select_feat(train_data, valid_data, test_data, select_all=True):
-    '''Selects useful features to perform regression'''
-    y_train, y_valid = train_data[:, -1], valid_data[:, -1]
-    raw_x_train, raw_x_valid, raw_x_test = train_data[:, :-1], valid_data[:, :-1], test_data
+batch_size = 8
+_dataset_dir = "./food-11"
+# Construct datasets.
+# The argument "loader" tells how torchvision reads the data.
+current_dir = os.path.join(_dataset_dir, "training")
+print(current_dir)
+train_set = FoodDataset(current_dir, tfm=train_tfm)
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
-    if select_all:
-        feat_idx = list(range(raw_x_train.shape[1]))
+valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=test_tfm)
+valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+
+# "cuda" only when GPUs are available.
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+print(device)
+# The number of training epochs and patience.
+n_epochs = 4
+patience = 300  # If no improvement in 'patience' epochs, early stop
+
+# Initialize a model, and put it on the device specified.
+model = Classifier().to(device)
+
+# For the classification task, we use cross-entropy as the measurement of performance.
+criterion = nn.CrossEntropyLoss()
+
+# Initialize optimizer, you may fine-tune some hyperparameters such as learning rate on your own.
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0003, weight_decay=1e-5)
+
+# Initialize trackers, these are not parameters and should not be changed
+stale = 0
+best_acc = 0
+
+_exp_name = "sample"
+for epoch in range(n_epochs):
+
+    # ---------- Training ----------
+    # Make sure the model is in train mode before training.
+    model.train()
+
+    # These are used to record information in training.
+    train_loss = []
+    train_accs = []
+
+    for batch in tqdm(train_loader):
+        # A batch consists of image data and corresponding labels.
+        imgs, labels = batch
+        # imgs = imgs.half()
+        # print(imgs.shape,labels.shape)
+
+        # Forward the data. (Make sure data and model are on the same device.)
+        logits = model(imgs.to(device))
+
+        # Calculate the cross-entropy loss.
+        # We don't need to apply softmax before computing cross-entropy as it is done automatically.
+        loss = criterion(logits, labels.to(device))
+
+        # Gradients stored in the parameters in the previous step should be cleared out first.
+        optimizer.zero_grad()
+
+        # Compute the gradients for parameters.
+        loss.backward()
+
+        # Clip the gradient norms for stable training.
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
+
+        # Update the parameters with computed gradients.
+        optimizer.step()
+
+        # Compute the accuracy for current batch.
+        acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
+
+        # Record the loss and accuracy.
+        train_loss.append(loss.item())
+        train_accs.append(acc)
+
+    train_loss = sum(train_loss) / len(train_loss)
+    train_acc = sum(train_accs) / len(train_accs)
+
+    # Print the information.
+    print(f"[ Train | {epoch + 1:03d}/{n_epochs:03d} ] loss = {train_loss:.5f}, acc = {train_acc:.5f}")
+
+    # ---------- Validation ----------
+    # Make sure the model is in eval mode so that some modules like dropout are disabled and work normally.
+    model.eval()
+
+    # These are used to record information in validation.
+    valid_loss = []
+    valid_accs = []
+
+    # Iterate the validation set by batches.
+    for batch in tqdm(valid_loader):
+        # A batch consists of image data and corresponding labels.
+        imgs, labels = batch
+        # imgs = imgs.half()
+
+        # We don't need gradient in validation.
+        # Using torch.no_grad() accelerates the forward process.
+        with torch.no_grad():
+            logits = model(imgs.to(device))
+
+        # We can still compute the loss (but not the gradient).
+        loss = criterion(logits, labels.to(device))
+
+        # Compute the accuracy for current batch.
+        acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
+
+        # Record the loss and accuracy.
+        valid_loss.append(loss.item())
+        valid_accs.append(acc)
+        # break
+
+    # The average loss and accuracy for entire validation set is the average of the recorded values.
+    valid_loss = sum(valid_loss) / len(valid_loss)
+    valid_acc = sum(valid_accs) / len(valid_accs)
+
+    # Print the information.
+    print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f}")
+
+    # update logs
+    if valid_acc > best_acc:
+        with open(f"./{_exp_name}_log.txt", "a"):
+            print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f} -> best")
     else:
-        feat_idx = [0, 1, 2, 3, 4]  # TODO: Select suitable feature columns.
+        with open(f"./{_exp_name}_log.txt", "a"):
+            print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f}")
 
-    return raw_x_train[:, feat_idx], raw_x_valid[:, feat_idx], raw_x_test[:, feat_idx], y_train, y_valid
+    # save models
+    if valid_acc > best_acc:
+        print(f"Best model found at epoch {epoch}, saving model")
+        torch.save(model.state_dict(), f"{_exp_name}_best.ckpt")  # only save best to prevent output memory exceed error
+        best_acc = valid_acc
+        stale = 0
+    else:
+        stale += 1
+        if stale > patience:
+            print(f"No improvment {patience} consecutive epochs, early stopping")
+            break
 
+test_set = FoodDataset(os.path.join(_dataset_dir, "testing"), tfm=test_tfm)
+test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
-def trainer(train_loader, valid_loader, model, config, device):
-    criterion = nn.MSELoss(reduction='mean')  # Define your loss function, do not modify this.
-
-    # Define your optimization algorithm.
-    # TODO: Please check https://pytorch.org/docs/stable/optim.html to get more available algorithms.
-    # TODO: L2 regularization (optimizer(weight decay...) or implement by your self).
-    optimizer = torch.optim.SGD(model.parameters(), lr=config['learning_rate'], momentum=0.9)
-
-    # 训练过程可视化器
-    writer = SummaryWriter()  # Writer of tensoboard.
-
-    # 创建保存model的路径，每次迭代都需要保存model
-    if not os.path.isdir('./models'):
-        os.mkdir('./models')  # Create directory of saving models.
-
-    n_epochs, best_loss, step, early_stop_count = config['n_epochs'], math.inf, 0, 0
-
-    for epoch in range(n_epochs):
-        model.train()  # Set your model to train mode.
-        loss_record = []
-
-        # tqdm is a package to visualize your training progress.
-        train_pbar = tqdm(train_loader, position=0, leave=True)
-
-        for x, y in train_pbar:
-            optimizer.zero_grad()  # Set gradient to zero.
-            x, y = x.to(device), y.to(device)  # Move your data to device.
-            pred = model(x)
-            loss = criterion(pred, y)
-            loss.backward()  # Compute gradient(backpropagation).
-            optimizer.step()  # Update parameters.
-            step += 1
-            loss_record.append(loss.detach().item())
-
-            # Display current epoch number and loss on tqdm progress bar.
-            train_pbar.set_description(f'Epoch [{epoch + 1}/{n_epochs}]')
-            train_pbar.set_postfix({'loss': loss.detach().item()})
-
-        mean_train_loss = sum(loss_record) / len(loss_record)
-        writer.add_scalar('Loss/train', mean_train_loss, step)
-
-        # 在验证集上进行模型准确率的分析验证。
-        model.eval()  # Set your model to evaluation mode.
-        loss_record = []
-        for x, y in valid_loader:
-            x, y = x.to(device), y.to(device)
-            with torch.no_grad():
-                pred = model(x)
-                loss = criterion(pred, y)
-
-            loss_record.append(loss.item())
-
-        mean_valid_loss = sum(loss_record) / len(loss_record)
-        print(f'Epoch [{epoch + 1}/{n_epochs}]: Train loss: {mean_train_loss:.4f}, Valid loss: {mean_valid_loss:.4f}')
-        writer.add_scalar('Loss/valid', mean_valid_loss, step)
-
-        if mean_valid_loss < best_loss:  # 如果当前loss低于过去最低的loss，则记录loss，并保存当前最好的模型。
-            best_loss = mean_valid_loss
-            torch.save(model.state_dict(), config['save_path'])  # Save your best model
-            print('Saving model with loss {:.3f}...'.format(best_loss))
-            early_stop_count = 0
-        else:
-            early_stop_count += 1
-
-        if early_stop_count >= config['early_stop']:
-            print('\nModel is not improving, so we halt the training session.')
-            return
+model_best = Classifier().to(device)
+model_best.load_state_dict(torch.load(f"{_exp_name}_best.ckpt"))
+model_best.eval()
+prediction = []
+with torch.no_grad():
+    for data, _ in test_loader:
+        test_pred = model_best(data.to(device))
+        test_label = np.argmax(test_pred.cpu().data.numpy(), axis=1)
+        prediction += test_label.squeeze().tolist()
 
 
-device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-config = {
-    'seed': 5201314,      # 制定模型的随即种子以保证模型的可恢复性。Your seed number, you can pick your lucky number. :)
-    'select_all': True,   # Whether to use all features.
-    'valid_ratio': 0.2,   # validation_size = train_size * valid_ratio
-    'n_epochs': 30000,     # Number of epochs.
-    'batch_size': 1024,
-    'learning_rate': 1e-5,
-    'early_stop': 400,    # If model has not improved for this many consecutive epochs, stop training.
-    # 任一时刻连续400次没有模型训练降低loss，就会提前停止。
-    'save_path': './models/model.ckpt'  # Your model will be saved here.
-}
+def pad4(i):
+    return "0" * (4 - len(str(i))) + str(i)
 
 
-# Set seed for reproducibility
-same_seed(config['seed'])
-
-
-# train_data size: 2699 x 118 (id + 37 states + 16 features x 5 days)
-# test_data size: 1078 x 117 (without last day's positive rate)
-train_data, test_data = pd.read_csv('./covid.train.csv').values, pd.read_csv('./covid.test.csv').values
-train_data, valid_data = train_valid_split(train_data, config['valid_ratio'], config['seed'])# 按照k折交叉验证法分成训练集和验证集
-
-# Print out the data size.
-print(f"""train_data size: {train_data.shape} 
-valid_data size: {valid_data.shape} 
-test_data size: {test_data.shape}""")
-
-# Select features
-x_train, x_valid, x_test, y_train, y_valid = select_feat(train_data, valid_data, test_data, config['select_all'])
-
-# Print out the number of features.
-print(f'number of features: {x_train.shape[1]}')
-
-train_dataset, valid_dataset, test_dataset = COVID19Dataset(x_train, y_train), \
-                                            COVID19Dataset(x_valid, y_valid), \
-                                            COVID19Dataset(x_test)
-
-# 用统一的Pytorch加载器包装待处理数据 Pytorch data loader loads pytorch dataset into batches.
-train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, pin_memory=True)
-valid_loader = DataLoader(valid_dataset, batch_size=config['batch_size'], shuffle=True, pin_memory=True)
-test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, pin_memory=True)
-
-model = My_Model(input_dim=x_train.shape[1]).to(device) # put your model and data on the same computation device.
-trainer(train_loader, valid_loader, model, config, device)
+df = pd.DataFrame()
+df["Id"] = [pad4(i) for i in range(1, len(test_set) + 1)]
+df["Category"] = prediction
+df.to_csv("submission.csv", index=False)
